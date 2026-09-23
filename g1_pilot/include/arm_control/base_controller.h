@@ -35,8 +35,8 @@ protected:
     pinocchio::Model model_;
     pinocchio::Data data_;
 
-    pinocchio::JointIndex left_ee_id_;
-    pinocchio::JointIndex right_ee_id_;
+    pinocchio::FrameIndex left_ee_id_;
+    pinocchio::FrameIndex right_ee_id_;
 
     Eigen::VectorXd current_joint_pos_;
     Eigen::VectorXd last_joint_pos_;

@@ -3,6 +3,7 @@
 
 #include "interfaces.h"
 
+#include <Eigen/Geometry>
 #include <map>
 #include <pinocchio/multibody/geometry.hpp>
 #include <pinocchio/multibody/data.hpp>
@@ -40,6 +41,7 @@ protected:
     struct EEFrame {
         std::string parent_joint;
         Eigen::Vector3d offset = Eigen::Vector3d::Zero();
+        Eigen::Matrix3d rotation = Eigen::Matrix3d::Identity();
     };
 
     void extract_config();

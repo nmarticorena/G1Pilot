@@ -106,6 +106,21 @@ void Humanoid::extract_config() {
             n["offset"][1].as<double>(),
             n["offset"][2].as<double>()
         );
+        const YAML::Node quaternion = n["quaternion_wxyz"];
+        if (quaternion) {
+            if (!quaternion.IsSequence() || quaternion.size() != 4) {
+                throw std::runtime_error(
+                    "end-effector quaternion_wxyz must contain four values");
+            }
+            Eigen::Quaterniond q(
+                quaternion[0].as<double>(), quaternion[1].as<double>(),
+                quaternion[2].as<double>(), quaternion[3].as<double>());
+            if (q.norm() < 1.0e-8) {
+                throw std::runtime_error(
+                    "end-effector quaternion_wxyz has near-zero norm");
+            }
+            ee.rotation = q.normalized().toRotationMatrix();
+        }
         return ee;
     };
     YAML::Node ees = config["end_effectors"];
@@ -141,7 +156,7 @@ void Humanoid::apply_joint_limit_overrides() {
 void Humanoid::add_end_effector_frames() {
     auto add = [&](const std::string& frame_name, const EEFrame& ee) {
         auto parent_id = model_full.getJointId(ee.parent_joint);
-        pinocchio::SE3 placement(Eigen::Matrix3d::Identity(), ee.offset);
+        pinocchio::SE3 placement(ee.rotation, ee.offset);
         model_full.addFrame(pinocchio::Frame(
             frame_name, parent_id, placement, pinocchio::OP_FRAME
         ));

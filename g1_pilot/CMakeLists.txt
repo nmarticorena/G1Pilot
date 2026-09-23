@@ -21,13 +21,13 @@ else()
     endif()
 endif()
 
-list(APPEND CMAKE_PREFIX_PATH /opt/openrobots)
-set(CMAKE_INSTALL_RPATH "/opt/openrobots/lib")
-set(CMAKE_BUILD_RPATH "/opt/openrobots/lib")
+# list(APPEND CMAKE_PREFIX_PATH /opt/openrobots)
+# set(CMAKE_INSTALL_RPATH "/opt/openrobots/lib")
+# set(CMAKE_BUILD_RPATH "/opt/openrobots/lib")
 
 # ---- Options & Dependencies ---- #
 
-find_package(casadi REQUIRED)
+find_package(casadi CONFIG REQUIRED)
 find_package(pinocchio REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(ompl REQUIRED)
@@ -57,7 +57,7 @@ target_include_directories(g1_pilot PUBLIC
     ${OMPL_INCLUDE_DIRS}
 )
 
-target_link_libraries(g1_pilot PUBLIC Eigen3::Eigen pinocchio::pinocchio casadi::casadi yaml-cpp ${OMPL_LIBRARIES})
+target_link_libraries(g1_pilot PUBLIC Eigen3::Eigen pinocchio::pinocchio casadi yaml-cpp ${OMPL_LIBRARIES})
 
 # ---- Testing ---- #
 
