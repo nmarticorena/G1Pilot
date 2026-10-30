@@ -8,17 +8,46 @@
 #include <pinocchio/multibody/geometry.hpp>
 
 #include <Eigen/Dense>
+#include <yaml-cpp/yaml.h>
 #include <vector>
 #include <string>
 
 
 namespace HumanoidPilot {
 
+// casadi nlpsol plugin ("ipopt", "sqpmethod", ...) and its options, e.g.
+// "ipopt.max_iter" or "qpsol_options". The defaults reproduce the original
+// hard-coded IPOPT setup.
+struct IKSolverOptions {
+    std::string plugin = "ipopt";
+    casadi::Dict options = {
+        {"print_time", false},
+        {"ipopt.sb", "yes"},
+        {"ipopt.print_level", 0},
+        {"ipopt.max_iter", 50},
+        {"ipopt.tol", 1e-6},
+        {"ipopt.acceptable_tol", 5e-4},
+        {"ipopt.acceptable_iter", 5},
+        {"ipopt.warm_start_init_point", "yes"},
+        {"ipopt.derivative_test", "none"},
+        {"ipopt.jacobian_approximation", "exact"},
+    };
+    // Replace the exact Hessian of the cost with its Gauss-Newton
+    // approximation (ik_solver.hessian: gauss_newton).
+    bool gauss_newton_hessian = false;
+};
+
+// Reads an ik_solver section ({plugin, hessian, options}); a missing
+// section or key keeps the defaults above. Option values keep their YAML
+// types: integers, floats, true/false, strings and nested maps.
+IKSolverOptions parse_ik_solver_options(const YAML::Node& section);
+
 class HumanoidIK {
 public:
     HumanoidIK(
         pinocchio::Model& model,
-        pinocchio::GeometryModel& geom_model
+        pinocchio::GeometryModel& geom_model,
+        const IKSolverOptions& solver_options = IKSolverOptions()
     );
 
     virtual JointState solve_ik(
@@ -51,7 +80,14 @@ public:
     void reset();
 
 protected:
-    void setup_optimization();
+    void setup_optimization(const IKSolverOptions& solver_options);
+    // Runs one of the solvers below from init_data_ and returns its solution
+    // (the last iterate when it does not converge).
+    Eigen::VectorXd solve(
+        casadi::Function& solver,
+        casadi::DM& lam_x,
+        const casadi::DM& params
+    );
     void filter_adjacent_collision_pairs();
 
     void generalize_ext_wrenches(
@@ -65,22 +101,16 @@ protected:
     pinocchio::GeometryModel geom_model_;
     pinocchio::GeometryData geom_data_;
 
-    casadi::Opti opti_l_;
-    casadi::Opti opti_r_;
-    casadi::Opti opti_;
-
-    casadi::MX b_var_q_;
-    casadi::MX b_var_q_last_;
-    casadi::MX b_param_tf_l_;
-    casadi::MX b_param_tf_r_;
-
-    casadi::MX l_var_q_;
-    casadi::MX l_var_q_last_;
-    casadi::MX l_param_tf_l_;
-
-    casadi::MX r_var_q_;
-    casadi::MX r_var_q_last_;
-    casadi::MX r_param_tf_r_;
+    // nlpsol functions built once: x = q, p = [q_last; vec(target(s))].
+    casadi::Function both_solver_;
+    casadi::Function left_solver_;
+    casadi::Function right_solver_;
+    casadi::DM lower_limits_;
+    casadi::DM upper_limits_;
+    // Bound multipliers of each solver's last solution, for its warm start.
+    casadi::DM both_lam_x_;
+    casadi::DM left_lam_x_;
+    casadi::DM right_lam_x_;
 
     pinocchio::FrameIndex L_hand_id_;
     pinocchio::FrameIndex R_hand_id_;

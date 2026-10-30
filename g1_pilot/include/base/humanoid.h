@@ -2,6 +2,7 @@
 #define HUMANOID_H
 
 #include "interfaces.h"
+#include "../arm_ik/robot_arm_ik.h"
 
 #include <Eigen/Geometry>
 #include <map>
@@ -75,6 +76,9 @@ protected:
         double upper;
     };
     std::map<std::string, JointLimit> joint_limit_overrides_;
+
+    // Solver for every HumanoidIK built from this config (ik_solver section).
+    IKSolverOptions ik_solver_options_;
 
     Eigen::VectorXd q;
     Eigen::VectorXd v;

@@ -18,9 +18,83 @@
 
 namespace HumanoidPilot {
 
+namespace {
+
+casadi::GenericType yaml_to_generic(const YAML::Node& node, const std::string& key) {
+    if (node.IsMap()) {
+        casadi::Dict dict;
+        for (const auto& kv : node) {
+            const std::string name = kv.first.as<std::string>();
+            dict[name] = yaml_to_generic(kv.second, key + "." + name);
+        }
+        return dict;
+    }
+    if (node.IsSequence()) {
+        // Lists of strings only, e.g. jit_options.flags.
+        std::vector<std::string> list;
+        for (const auto& item : node) {
+            list.push_back(item.as<std::string>());
+        }
+        return list;
+    }
+    if (!node.IsScalar()) {
+        throw std::runtime_error("ik_solver option " + key + " must be a scalar, list or map");
+    }
+    const std::string text = node.Scalar();
+    // Quoted scalars ("yes", "exact") stay strings.
+    if (node.Tag() != "!") {
+        if (text == "true") return true;
+        if (text == "false") return false;
+        try {
+            std::size_t used = 0;
+            const long long value = std::stoll(text, &used);
+            if (used == text.size()) return static_cast<casadi_int>(value);
+        } catch (const std::exception&) {}
+        try {
+            std::size_t used = 0;
+            const double value = std::stod(text, &used);
+            if (used == text.size()) return value;
+        } catch (const std::exception&) {}
+    }
+    return text;
+}
+
+} // namespace
+
+IKSolverOptions parse_ik_solver_options(const YAML::Node& section) {
+    IKSolverOptions result;
+    if (!section) {
+        return result;
+    }
+    if (section["plugin"]) {
+        result.plugin = section["plugin"].as<std::string>();
+    }
+    if (section["hessian"]) {
+        const std::string hessian = section["hessian"].as<std::string>();
+        if (hessian != "exact" && hessian != "gauss_newton") {
+            throw std::runtime_error(
+                "ik_solver.hessian must be exact or gauss_newton, not " + hessian);
+        }
+        result.gauss_newton_hessian = hessian == "gauss_newton";
+    }
+    if (const YAML::Node options = section["options"]) {
+        if (!options.IsMap()) {
+            throw std::runtime_error("ik_solver.options must be a map");
+        }
+        // A configured solver replaces the default IPOPT options entirely.
+        result.options.clear();
+        for (const auto& kv : options) {
+            const std::string name = kv.first.as<std::string>();
+            result.options[name] = yaml_to_generic(kv.second, name);
+        }
+    }
+    return result;
+}
+
 HumanoidIK::HumanoidIK(
     pinocchio::Model& model,
-    pinocchio::GeometryModel& geom_model
+    pinocchio::GeometryModel& geom_model,
+    const IKSolverOptions& solver_options
 ) : model_(model), geom_model_(geom_model)
 {
     // Get required joint IDs    
@@ -34,7 +108,7 @@ HumanoidIK::HumanoidIK(
     filter_adjacent_collision_pairs();
 
     // Setup IK problem
-    setup_optimization();
+    setup_optimization(solver_options);
 
     // Initialize data structures
     data_ = pinocchio::Data(model_);
@@ -74,7 +148,7 @@ void HumanoidIK::filter_adjacent_collision_pairs() {
     geom_model_.collisionPairs = filtered_pairs;
 }
 
-void HumanoidIK::setup_optimization() {
+void HumanoidIK::setup_optimization(const IKSolverOptions& solver_options) {
 
     pinocchio::ModelTpl<casadi::SX> cmodel(model_.cast<casadi::SX>());
     pinocchio::DataTpl<casadi::SX> cdata(cmodel);
@@ -147,74 +221,104 @@ void HumanoidIK::setup_optimization() {
         0.1 * casadi::SX::sumsqr(cq - cq_last)
     );
 
-    // Functions
-    casadi::Function both_arm_cost_f = casadi::Function(
-        "both_arm_cost",
-        {cq, cq_last, cTf_l, cTf_r},
-        {both_arm_cost}
+    // Parameters: the previous solution, then each target column-major (as
+    // eigen_to_casadi lays it out).
+    const casadi::SX vec_tf_l = casadi::SX::vec(cTf_l);
+    const casadi::SX vec_tf_r = casadi::SX::vec(cTf_r);
+
+    lower_limits_ = eigen_to_casadi(model_.lowerPositionLimit);
+    upper_limits_ = eigen_to_casadi(model_.upperPositionLimit);
+
+    // Gauss-Newton Hessian: 2 J^T J of the weighted pose residual plus the
+    // (exact) Hessian of the two quadratic regularization terms. Positive
+    // definite and much cheaper to evaluate than the exact Hessian of log6.
+    auto gauss_newton_hessian = [&](
+        const std::string& name, const casadi::SX& p,
+        const casadi::SX& pose_residual
+    ) {
+        const casadi::SX lam_f = casadi::SX::sym("lam_f");
+        const casadi::SX lam_g = casadi::SX::sym("lam_g", 0, 1);
+        const casadi::SX J = casadi::SX::jacobian(pose_residual, cq);
+        const casadi::SX H = 2.0 * casadi::SX::mtimes(J.T(), J) +
+            2.0 * (0.005 + 0.1) * casadi::SX::eye(cmodel.nq);
+        // IPOPT takes the upper triangle, sqpmethod the full matrix.
+        const bool triu = solver_options.plugin == "ipopt";
+        return casadi::Function(
+            name + "_hess_lag",
+            {cq, p, lam_f, lam_g},
+            {triu ? casadi::SX::triu(lam_f * H) : lam_f * H},
+            {"x", "p", "lam_f", "lam_g"},
+            {triu ? "triu_hess_gamma_x_x" : "hess_gamma_x_x"}
+        );
+    };
+    auto make_solver = [&](
+        const std::string& name, const casadi::SX& p, const casadi::SX& cost,
+        const casadi::SX& pose_residual
+    ) {
+        casadi::Dict opts = solver_options.options;
+        if (solver_options.gauss_newton_hessian) {
+            opts["hess_lag"] = gauss_newton_hessian(name, p, pose_residual);
+        }
+        return casadi::nlpsol(
+            name, solver_options.plugin,
+            casadi::SXDict{{"x", cq}, {"p", p}, {"f", cost}},
+            opts
+        );
+    };
+
+    const casadi::SX left_residual = casadi::SX::vertcat({
+        std::sqrt(50.0) * left_trans_err, std::sqrt(3.0) * left_rot_err
+    });
+    const casadi::SX right_residual = casadi::SX::vertcat({
+        std::sqrt(50.0) * right_trans_err, std::sqrt(3.0) * right_rot_err
+    });
+
+    both_solver_ = make_solver(
+        "ik_both", casadi::SX::vertcat({cq_last, vec_tf_l, vec_tf_r}),
+        both_arm_cost, casadi::SX::vertcat({left_residual, right_residual})
     );
-    casadi::Function left_arm_cost_f = casadi::Function(
-        "left_arm_cost",
-        {cq, cq_last, cTf_l},
-        {left_arm_cost}
+    left_solver_ = make_solver(
+        "ik_left", casadi::SX::vertcat({cq_last, vec_tf_l}),
+        left_arm_cost, left_residual
     );
-    casadi::Function right_arm_cost_f = casadi::Function(
-        "right_arm_cost",
-        {cq, cq_last, cTf_r},
-        {right_arm_cost}
+    right_solver_ = make_solver(
+        "ik_right", casadi::SX::vertcat({cq_last, vec_tf_r}),
+        right_arm_cost, right_residual
     );
 
-    b_var_q_ = opti_.variable(model_.nq, 1);
-    b_var_q_last_ = opti_.parameter(model_.nq, 1);
-    b_param_tf_l_ = opti_.parameter(4, 4);
-    b_param_tf_r_ = opti_.parameter(4, 4);
+    both_lam_x_ = casadi::DM::zeros(model_.nq, 1);
+    left_lam_x_ = casadi::DM::zeros(model_.nq, 1);
+    right_lam_x_ = casadi::DM::zeros(model_.nq, 1);
 
-    l_var_q_ = opti_l_.variable(model_.nq, 1);
-    l_var_q_last_ = opti_l_.parameter(model_.nq, 1);
-    l_param_tf_l_ = opti_l_.parameter(4, 4);
+}
 
-    r_var_q_ = opti_r_.variable(model_.nq, 1);
-    r_var_q_last_ = opti_r_.parameter(model_.nq, 1);
-    r_param_tf_r_ = opti_r_.parameter(4, 4);
-            
-    casadi::DM lower_limits = eigen_to_casadi(model_.lowerPositionLimit);
-    casadi::DM upper_limits = eigen_to_casadi(model_.upperPositionLimit);
+Eigen::VectorXd HumanoidIK::solve(
+    casadi::Function& solver,
+    casadi::DM& lam_x,
+    const casadi::DM& params
+)
+{
+    casadi::DMDict result = solver(casadi::DMDict{
+        {"x0", eigen_to_casadi(init_data_)},
+        {"p", params},
+        {"lbx", lower_limits_},
+        {"ubx", upper_limits_},
+        {"lam_x0", lam_x}
+    });
 
-    opti_.subject_to(opti_.bounded(lower_limits, b_var_q_, upper_limits));
-    opti_l_.subject_to(opti_l_.bounded(lower_limits, l_var_q_, upper_limits));
-    opti_r_.subject_to(opti_r_.bounded(lower_limits, r_var_q_, upper_limits));
+    const casadi::Dict stats = solver.stats();
+    const auto success = stats.find("success");
+    if (success == stats.end() || !success->second.to_bool()) {
+        const auto status = stats.find("return_status");
+        std::cerr << "ERROR in convergence: "
+                  << (status != stats.end() ? status->second.to_string() : "unknown")
+                  << std::endl;
+    }
 
-    // Minimize
-    opti_.minimize(both_arm_cost_f({
-        b_var_q_, b_var_q_last_, b_param_tf_l_, b_param_tf_r_
-    })[0]);
-    opti_l_.minimize(left_arm_cost_f({
-        l_var_q_, l_var_q_last_, l_param_tf_l_
-    })[0]);
-    opti_r_.minimize(right_arm_cost_f({
-        r_var_q_, r_var_q_last_, r_param_tf_r_
-    })[0]);
-    
-    // Set optimization options
-    casadi::Dict opts;
-    opts["expand"] = true;
-    opts["detect_simple_bounds"] = true;
-    opts["calc_lam_p"] = false;
-    opts["print_time"] = false;
-    opts["ipopt.sb"] = "yes";
-    opts["ipopt.print_level"] = 0;
-    opts["ipopt.max_iter"] = 50;
-    opts["ipopt.tol"] = 1e-6;
-    opts["ipopt.acceptable_tol"] = 5e-4;
-    opts["ipopt.acceptable_iter"] = 5;
-    opts["ipopt.warm_start_init_point"] = "yes";
-    opts["ipopt.derivative_test"] = "none";
-    opts["ipopt.jacobian_approximation"] = "exact";
-    
-    opti_.solver("ipopt", opts);
-    opti_l_.solver("ipopt", opts);
-    opti_r_.solver("ipopt", opts);
-
+    lam_x = result.at("lam_x");
+    const std::vector<double> sol_q_vec =
+        static_cast<std::vector<double>>(result.at("x"));
+    return Eigen::Map<const Eigen::VectorXd>(sol_q_vec.data(), model_.nq);
 }
 
 void HumanoidIK::reset() {
@@ -252,34 +356,12 @@ JointState HumanoidIK::solve_ik(
         init_data_ = *current_lr_arm_motor_q;
     }
 
-    // Set optimization initial guess and parameters
-    opti_.set_initial(b_var_q_, eigen_to_casadi(init_data_));
-    opti_.set_value(b_param_tf_l_, eigen_to_casadi(left_wrist));
-    opti_.set_value(b_param_tf_r_, eigen_to_casadi(right_wrist));
-    opti_.set_value(b_var_q_last_, eigen_to_casadi(init_data_));
-
-    // Solve optimization problem
-    std::vector<double> sol_q_vec;
-
-    try {
-
-        // Solve optimization problem
-        casadi::OptiSol sol = opti_.solve();
-
-        // Extract solution
-        sol_q_vec = static_cast<std::vector<double>>(sol.value(b_var_q_));
-
-    } catch (const std::exception& e) {
-        std::cerr << "ERROR in convergence: " << e.what() << std::endl;
-        
-        // Get debug solution
-        sol_q_vec = static_cast<std::vector<double>>(
-            opti_.debug().value(b_var_q_)
-        );
-
-    }
-
-    sol_q = Eigen::Map<Eigen::VectorXd>(sol_q_vec.data(), model_.nq);
+    // Solve from, and regularize toward, the initial guess
+    sol_q = solve(both_solver_, both_lam_x_, casadi::DM::vertcat({
+        eigen_to_casadi(init_data_),
+        casadi::DM::vec(eigen_to_casadi(left_wrist)),
+        casadi::DM::vec(eigen_to_casadi(right_wrist))
+    }));
 
     pinocchio::framesForwardKinematics(model_, data_, sol_q);
 
@@ -340,45 +422,14 @@ JointState HumanoidIK::solve_ik(
         init_data_ = *current_lr_arm_motor_q;
     }
 
-    if (left){
-        opti_l_.set_initial(l_var_q_, eigen_to_casadi(init_data_));
-        opti_l_.set_value(l_param_tf_l_, eigen_to_casadi(wrist));
-        opti_l_.set_value(l_var_q_last_, eigen_to_casadi(init_data_));
-    } else {
-        opti_r_.set_initial(r_var_q_, eigen_to_casadi(init_data_));
-        opti_r_.set_value(r_param_tf_r_, eigen_to_casadi(wrist));
-        opti_r_.set_value(r_var_q_last_, eigen_to_casadi(init_data_));
-    }
-
-    // Solve optimization problem
-    std::vector<double> sol_q_vec;
-    
-    try {
-        if (left){
-            casadi::OptiSol sol = opti_l_.solve();
-            sol_q_vec = static_cast<std::vector<double>>(sol.value(l_var_q_));
-        } else {
-            casadi::OptiSol sol = opti_r_.solve();
-            sol_q_vec = static_cast<std::vector<double>>(sol.value(r_var_q_));
-        }
-
-    } catch (const std::exception& e) {
-        std::cerr << "ERROR in convergence: " << e.what() << std::endl;
-        
-        // Get debug solution
-        if (left){
-            sol_q_vec = static_cast<std::vector<double>>(
-                opti_.debug().value(l_var_q_)
-            );
-        } else {
-            sol_q_vec = static_cast<std::vector<double>>(
-                opti_.debug().value(r_var_q_)
-            );
-        }
-        
-    }
-
-    sol_q = Eigen::Map<Eigen::VectorXd>(sol_q_vec.data(), model_.nq);
+    // Solve from, and regularize toward, the initial guess
+    const casadi::DM params = casadi::DM::vertcat({
+        eigen_to_casadi(init_data_),
+        casadi::DM::vec(eigen_to_casadi(wrist))
+    });
+    sol_q = left
+        ? solve(left_solver_, left_lam_x_, params)
+        : solve(right_solver_, right_lam_x_, params);
 
     pinocchio::framesForwardKinematics(model_, data_, sol_q);
 

@@ -50,7 +50,8 @@ Humanoid::Humanoid(
     // Initialize Tools with appropriate models
     ik = new HumanoidIK(
         model, 
-        geom
+        geom,
+        ik_solver_options_
     );
     controller = new IKTrajTracker(model, ik);
     motion_planner = new VisualServoPlanner(model, ik);
@@ -136,6 +137,8 @@ void Humanoid::extract_config() {
         lim.upper = kv.second["upper"].as<double>();
         joint_limit_overrides_[joint_name] = lim;
     }
+
+    ik_solver_options_ = parse_ik_solver_options(root["ik_solver"]);
 }
 
 void Humanoid::apply_joint_limit_overrides() {
